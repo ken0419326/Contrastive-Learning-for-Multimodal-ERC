@@ -1,0 +1,322 @@
+import argparse
+import numpy as np
+import random
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from dataloader import MELDRobertaDataset
+from model import ECERC
+from sklearn import metrics
+from sklearn.metrics import f1_score, accuracy_score
+from torch.utils.data import DataLoader
+from loss import Loss
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+def seed_everything(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def get_MELD_bert_loaders(path, batch_size=32, classify='emotion', num_workers=0, pin_memory=False):
+    trainset = MELDRobertaDataset('train')
+    validset = MELDRobertaDataset('valid')
+    testset = MELDRobertaDataset('test')
+
+    # --- 定義採樣優先級 (Sampling Priority) ---
+    # 這只影響 "模型看到它的次數"，不影響 "算分的方式"
+    # 讓含有 Sad/Fea 的對話更容易被抽出來
+    emotion_sampling_weights = {
+        0: 1.0,   # neu
+        1: 6.0,   # sur
+        2: 8.0,   # fea (稀有，多抽一點)
+        3: 10.0,   # sad (稀有，多抽一點)
+        4: 2.0,   # joy
+        5: 4.0,   # dis
+        6: 2.0    # ang
+    }
+    """
+    emotion_sampling_weights = {
+        0: 1.0,   # neu (基準)
+        1: 5.0,   # sur (原本 2.0 -> 提升到 5.0，目標 F1 > 0.59)
+        2: 10.0,  # fea (維持高檔)
+        3: 15.0,  # sad (原本 6.0 -> 暴增到 15.0，強制提升 Recall)
+        4: 2.0,   # joy (保持低，避免干擾 Sur)
+        5: 5.0,   # dis
+        6: 4.0    # ang (原本 2.0 -> 4.0，避免 Sad 被誤判成 Ang)
+    }
+    """
+
+    sample_weights = []
+    
+    for i in range(len(trainset)):
+        data = trainset[i]
+        
+        # 使用確認過的 Index 6 (Label)
+        dialogue_labels = data[6] 
+        
+        if isinstance(dialogue_labels, torch.Tensor):
+            dialogue_labels = dialogue_labels.tolist()
+        
+        # Max-Pooling: 如果這段對話含有一句 Sad，整段的採樣機率就變高
+        max_weight = 1.0
+        for label in dialogue_labels:
+            label_idx = int(label)
+            weight = emotion_sampling_weights.get(label_idx, 1.0)
+            if weight > max_weight:
+                max_weight = weight
+        
+        sample_weights.append(max_weight)
+
+    sample_weights = torch.DoubleTensor(sample_weights)
+
+    # 建立採樣器
+    sampler = WeightedRandomSampler(weights=sample_weights, 
+                                    num_samples=len(sample_weights), 
+                                    replacement=True)
+
+    train_loader = DataLoader(trainset,
+                              batch_size=batch_size,
+                              collate_fn=trainset.collate_fn,
+                              num_workers=num_workers,
+                              pin_memory=pin_memory,
+                              sampler=sampler,  # <--- 加入這一行
+                              shuffle=False  # shuffle for training data
+                              )
+
+    valid_loader = DataLoader(validset,
+                              batch_size=batch_size,
+                              collate_fn=trainset.collate_fn,
+                              num_workers=num_workers,
+                              pin_memory=pin_memory)
+
+    test_loader = DataLoader(testset,
+                             batch_size=batch_size,
+                             collate_fn=testset.collate_fn,
+                             num_workers=num_workers,
+                             pin_memory=pin_memory)
+
+    return train_loader, valid_loader, test_loader
+
+
+def train_or_eval_model(model, loss_f, dataloader, train_flag=False, optimizer=None, cuda_flag=False, feature_type='text', target_names=None):
+    assert not train_flag or optimizer != None
+    losses, preds, labels, masks = [], [], [], []
+
+    if train_flag:
+        model.train()
+    else:
+        model.eval()
+
+    for data in dataloader:
+        if train_flag:
+            optimizer.zero_grad()
+        # roberta_fea: CLS embedding of last hidden layer in RoBERTa
+        emo_roberta, sem_roberta, audio, vision, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda_flag else data[:-1]
+
+        if train_flag:
+            # Oversampling 必須搭配噪聲，防止過擬合！
+            noise = torch.randn_like(emo_roberta) * 0.01
+            emo_roberta = emo_roberta + noise
+
+        seq_lengths = [(umask[j] == 1).nonzero().tolist()[-1][0] + 1 for j in range(len(umask))]
+
+        if args.feature_type == "multi":
+            emo_roberta = torch.cat([emo_roberta,audio, vision], dim=-1)
+            sem_roberta = torch.cat([sem_roberta], dim=-1)
+
+        log_prob = model(emo_roberta,sem_roberta, qmask, umask, seq_lengths)
+
+        label = torch.cat([label[j][:seq_lengths[j]] for j in range(len(label))])
+        loss = loss_f(log_prob, label)
+
+        preds.append(torch.argmax(log_prob, 1).data.cpu().numpy())
+        labels.append(label.data.cpu().numpy())
+        losses.append(loss.item())
+
+        if train_flag:
+            loss.backward()
+            optimizer.step()
+
+    if preds != []:
+        preds = np.concatenate(preds)
+        labels = np.concatenate(labels)
+    else:
+        return float('nan'), float('nan'), float('nan'), [], []
+
+    labels = np.array(labels)
+    preds = np.array(preds)
+    avg_loss = round(np.sum(losses) / len(losses), 4)
+    avg_accuracy = round(accuracy_score(labels, preds) * 100, 2)
+    avg_fscore = round(f1_score(labels, preds, average='weighted') * 100, 2)
+
+    all_matrix = []
+    all_matrix.append(
+        metrics.classification_report(labels, preds, target_names=target_names if target_names else None, digits=4))
+    all_matrix.append(metrics.confusion_matrix(labels, preds))
+
+    return avg_loss, avg_accuracy, avg_fscore, all_matrix, []
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--feature_type', type=str, default='multi', help='feature type: text/multi')
+
+    parser.add_argument('--data_dir', type=str, default='../data/meld/meld_features_roberta.pkl', help='dataset dir: meld_features_roberta.pkl')
+
+    parser.add_argument('--output_dir', type=str, default='.', help='saved model dir')
+
+    parser.add_argument('--base_layer', type=int, default=1, help='the number of base model layers, 1/2')
+
+    parser.add_argument('--epochs', type=int, default=50, metavar='E', help='number of epochs')
+
+    parser.add_argument('--patience', type=int, default=20, help='early stop')
+
+    parser.add_argument('--batch-size', type=int, default=32, metavar='BS', help='batch size')
+
+    parser.add_argument('--use_valid_flag', action='store_true', default=True, help='use valid set')
+
+    parser.add_argument('--lr', type=float, default=0.000005, metavar='LR', help='learning rate: 0.0005')
+
+    parser.add_argument('--l2', type=float, default=0.0002, metavar='L2', help='L2 regularization weight')
+
+    parser.add_argument('--no-cuda', action='store_true', default=False, help='does not use GPU')
+
+    parser.add_argument('--class_weight', action='store_true', default=False, help='use class weights')
+
+    parser.add_argument('--cls_type', type=str, default='emotion', help='choose between sentiment or emotion')
+
+    parser.add_argument('--Dataset', type=str, default="MELD", help='DATASET')
+
+    args = parser.parse_args()
+
+    epochs, batch_size, output_path, data_path, base_layer, feature_type = \
+        args.epochs, args.batch_size, args.output_dir, args.data_dir, args.base_layer, args.feature_type
+    cuda_flag = torch.cuda.is_available() and not args.no_cuda
+
+    # MELD dataset
+    n_speakers, hidden_size, input_size = 9, 128, None
+    if args.cls_type.strip().lower() == 'emotion':
+        n_classes = 7
+        target_names = ['neu', 'sur', 'fea', 'sad', 'joy', 'dis', 'ang']
+
+        # perform 1/weight according to the weight of each label in training data
+        class_weights = torch.FloatTensor(
+            [1 / 0.469506857, 1 / 0.119346367, 1 / 0.026116137, 1 / 0.073096002, 1 / 0.168368836, 1 / 0.026334987, 1 / 0.117230814])
+        class_weights = torch.log(class_weights)
+    else:
+        n_classes = 3
+        target_names = ['0', '1', '2']
+        class_weights = torch.FloatTensor([1.0, 1.0, 1.0])
+
+    feat2dim = {'IS10': 1582, '3DCNN': 512, 'textCNN': 100, 'bert': 768, 'denseface': 342, 'MELD_text': 600,
+                'MELD_audio': 300}
+    D_audio = feat2dim['IS10'] if args.Dataset == 'IEMOCAP' else feat2dim['MELD_audio']
+    D_visual = feat2dim['denseface']
+    D_text = 1024
+
+    if feature_type == 'text':
+        input_size = D_text
+    elif feature_type == "multi":
+        input_size = D_text + D_audio + D_visual
+    else:
+        print('Error: feature_type not set.')
+        exit(0)
+
+    seed_everything()
+    model = ECERC(args, d_t=D_text, d_a=D_audio, d_v=D_visual,
+                        base_layer=base_layer,
+                        input_size=input_size,
+                        hidden_size=hidden_size,
+                        n_speakers=n_speakers,
+                        n_classes=n_classes,
+                        cuda_flag=cuda_flag)
+
+    if cuda_flag:
+        print('Running on GPU')
+        class_weights = class_weights.cuda()
+        model.cuda()
+    else:
+        print('Running on CPU')
+
+    name = 'ECERC'
+    print("The model have {} paramerters in total".format(sum(x.numel() for x in model.parameters())))
+    print('Running on the {} features........'.format(feature_type))
+
+    train_loader, valid_loader, test_loader = get_MELD_bert_loaders(data_path, batch_size=batch_size, classify=args.cls_type, num_workers=0)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
+    loss_f = Loss(alpha=class_weights if args.class_weight else None)
+
+    all_test_fscore, all_test_acc = [], []
+    best_epoch, best_epoch2, patience, best_eval_fscore, best_eval_loss = -1, -1, 0, 0, None
+    patience2 = 0
+    for e in range(epochs):
+        start_time = time.time()
+        train_loss, train_acc, train_fscore, _, _ = train_or_eval_model(model=model, loss_f=loss_f, dataloader=train_loader, train_flag=True,
+                                                                        optimizer=optimizer, cuda_flag=cuda_flag, feature_type=feature_type,
+                                                                        target_names=target_names)
+        valid_loss, valid_acc, valid_fscore, _, _ = train_or_eval_model(model=model, loss_f=loss_f, dataloader=valid_loader,
+                                                                        cuda_flag=cuda_flag, feature_type=feature_type, target_names=target_names)
+        test_loss, test_acc, test_fscore, test_metrics, _ = train_or_eval_model(model=model, loss_f=loss_f, dataloader=test_loader,
+                                                                                cuda_flag=cuda_flag, feature_type=feature_type, target_names=target_names)
+        all_test_fscore.append(test_fscore)
+        all_test_acc.append(test_acc)
+
+        if args.use_valid_flag:
+            eval_loss, _, eval_fscore = valid_loss, valid_acc, valid_fscore
+        else:
+            eval_loss, _, eval_fscore = test_loss, test_acc, test_fscore
+        if e == 0 or best_eval_fscore < eval_fscore:
+            patience = 0
+            best_epoch, best_eval_fscore = e, eval_fscore
+        else:
+            patience += 1
+        if best_eval_loss is None:
+            best_eval_loss = eval_loss
+            best_epoch2 = 0
+        else:
+            if eval_loss < best_eval_loss:
+                best_epoch2, best_eval_loss = e, eval_loss
+                patience2 = 0
+            else:
+                patience2 += 1
+
+        print(
+            'epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'. \
+                format(e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore,
+                       round(time.time() - start_time, 2)))
+        
+        # --- 新增：當找到更好的模型時，儲存起來 ---
+        if e == best_epoch:
+            save_path = f"{output_path}/ECERC_MODEL_best.pkl"
+            torch.save(model.state_dict(), save_path)
+            print(f">>> 最佳模型已儲存至: {save_path}")
+        # print(test_metrics[0])
+        # print(test_metrics[1])
+        # print('\n')
+
+        if patience >= args.patience and patience2 >= args.patience:
+            print('Early stoping...', patience, patience2)
+            break
+
+    print('Final Test performance...')
+    print('Early stoping...', patience, patience2)
+
+    print('Eval-metric: F1, Epoch: {}, best_eval_fscore: {}, Accuracy: {}, F1-Score: {}'.format(best_epoch, best_eval_fscore,
+                                                                                                all_test_acc[best_epoch] if best_epoch >= 0 else 0,
+                                                                                                all_test_fscore[best_epoch] if best_epoch >= 0 else 0))
+    print('Eval-metric: Loss, Epoch: {}, Accuracy: {}, F1-Score: {}'.format(best_epoch2,
+                                                                            all_test_acc[best_epoch2] if best_epoch2 >= 0 else 0,
+                                                                            all_test_fscore[best_epoch2] if best_epoch2 >= 0 else 0))
